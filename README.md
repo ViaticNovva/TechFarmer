@@ -17,7 +17,15 @@ This is an implementation for a user-run, one-server test—not a hosted bot, ve
 - Generic one-shot object matching is **not verified comic-character identity or re-identification**. Raw scores are ranking signals, not calibrated accuracy percentages. Review false positives and missed appearances. No supplied character/reference ground truth was available, so there is no recognition accuracy claim.
 - Model input copies are bounded/resized for inference; native coordinate mapping returns to the original EXIF-oriented page. **Final crops are taken from original-resolution pixels**, never model thumbnails. No invented upscale detail.
 - A framing reference guides **aspect only**, not pose, composition transfer, face/body segmentation or anatomy. Face, upper-body and full-body presets have no validated semantic backend and are held with **no crop** until you choose supported framing. A fixed top percentage is never represented as anatomical detection.
-- Direct raster images and explicit static-HTML reader profiles are supported. Unknown layouts, JavaScript-only readers and blocked sources stop/Lite jobs, edits and full provenance live locally in ignored `data/` and `exports/`. Private replies, uploaded reference attachments, requested contact sheets and export batches are **hosted by Discord**, not end-to-end encrypted or local-only. No user images are uploaded to Hugging Face. Only explicit model preparation downloads model files. Source URLs never appear in status/preview messages, unsafe exception logs or the Discord provenance file.
+- Direct raster images and explicit static-HTML reader profiles are supported. Unknown layouts, JavaScript-only readers and blocked sources stop/report partial progress. No third-party comic site—including the previously mentioned example—is verified compatible or licensed. No third-party artwork was downloaded for tests.
+
+## Rights and privacy first
+
+Use only pages/references you own, have licensed, or have explicit permission to download and edit. **Public access is not a license.** Personal use and ephemeral Discord messages do not establish rights. This software does not bypass login, paywalls, DRM, CAPTCHA, robots restrictions or other access controls. It does not forward cookies, authorization, referrers or proxy settings; it does not screenshot a reader or guess missing numbered pages.
+
+Source requests are limited to explicitly configured origins/path roots. DNS addresses are validated and pinned into the actual connector; redirects are rechecked and private/reserved/local addresses are refused. Reader image selection is scoped to configured selectors, not every image in arbitrary HTML.
+
+Originals, frozen references, SQLite jobs, edits and full provenance live locally in ignored `data/` and `exports/`. Private replies, uploaded reference attachments, requested contact sheets and export batches are **hosted by Discord**, not end-to-end encrypted or local-only. No user images are uploaded to Hugging Face. Only explicit model preparation downloads model files. Source URLs never appear in status/preview messages, unsafe exception logs or the Discord provenance file.
 
 Only unsigned stable source seeds are durable. URL credentials/fragments, undeclared queries and secret/signature/token-like query keys are rejected **before job persistence**. Explicitly declared nonsecret chapter/page routing keys can be retained privately to resume a reader. Discovered signed image URLs remain only in bounded, expiring source-client memory; they are not saved in state/provenance. Restart rediscovery obtains fresh image references.
 
@@ -49,7 +57,7 @@ python3.12 -m venv .venv
 .venv/bin/python -m tech_farmer run
 ```
 
-On Windows replace `.venv/bin/python` with `.venv\Scripts\python.exe`. The doctor/download commands use saved nonsecret cache/device settings if present, otherwise `.cache/models` and `cpu`. Explicit overrides: `--model-cache .cache/modreport partiaels --device cpu`.
+On Windows replace `.venv/bin/python` with `.venv\Scripts\python.exe`. The doctor/download commands use saved nonsecret cache/device settings if present, otherwise `.cache/models` and `cpu`. Explicit overrides: `--model-cache .cache/models --device cpu`.
 
 `requirements.txt` is lightweight. `requirements-vision.txt` pins Transformers 4.57.6, with Torch `>=2.2,<3` and safetensors `>=0.4.3,<1` compatibility ranges—not a tested full dependency lock in this offline environment. If torchvision is already installed, it must match your Torch build. CPU is the default; CUDA/MPS require working local hardware/backend support. Model cache plus runtime RAM may require several GB; performance is not benchmarked. The data/export budget does not include model cache size.
 
@@ -95,7 +103,7 @@ The harvest and optional reframe commands share:
 
 - `preset`: `detected`/`tight` use the detected region; `reference` uses the framing reference's aspect; `panel` needs a containing white-gutter heuristic panel; `face`/`upper_body`/`full_body` are unsupported semantic requests held without crop, not approximated.
 - `aspect`: positive `W:H` or numeric ratio, supported range 1:20 to 20:1; omitted preserves region aspect. At most pixel-rounding differences are possible. Impossible constraints block the crop rather than resize the page.
-- `context`: extra **pixels** in `left,top,right,m the same side simultaneously; enter the net instruction. Trimmed edges are hard boundaries; aspect expansion cannot put them back.
+- `context`: extra **pixels** in `left,top,right,bottom` order. `trim`: remove pixels in the same order. Do not pad and trim the same side simultaneously; enter the net instruction. Trimmed edges are hard boundaries; aspect expansion cannot put them back.
 - `align`: center, left, right, top, bottom, or a corner. Directional context is genuinely asymmetric. Boundary clipping/forced alignment adds review warnings.
 - `fit:contain` preserves the requested target/context where feasible; `fit:cover` explicitly permits aspect trimming. Neither upscales or invents detail.
 - `shape`: rectangle, ellipse or circle. Ellipse/circle adds an alpha mask at native resolution; circle requires 1:1. No destructive change to the original.
@@ -137,7 +145,7 @@ Blocked access, robots denial, unsafe DNS/redirects, unknown layouts, response/p
 
 ## Durable states and resource pauses
 
-The normal pipeline is `queued → discovering → matching → review_ready`. **`review_ready` means every discovered page was processed, not perfect identity or reviewed/accepted results.** `paused_source`, `review_partial`, `paused_budget`, `paused_model`, `paused_error`, `paused` and `paused_restart` are not completion. `/status` reports discovery completeness, page/canbottom` order. `trim`: remove pixels in the same order. Ddidate counts, failure counts and a safe diagnostic code; URLs are omitted.
+The normal pipeline is `queued → discovering → matching → review_ready`. **`review_ready` means every discovered page was processed, not perfect identity or reviewed/accepted results.** `paused_source`, `review_partial`, `paused_budget`, `paused_model`, `paused_error`, `paused` and `paused_restart` are not completion. `/status` reports discovery completeness, page/candidate counts, failure counts and a safe diagnostic code; URLs are omitted.
 
 - Successful pages/candidates remain durable. Resume re-discovers the seed safely, refreshes opaque fetch IDs, merges stable page identities, and retries unfinished/failed pages. Previously completed pages are not re-inferred. A missing previously discovered page is recorded as a failure, not quietly dropped.
 - Discovery cursors are in-memory only. The worker automatically follows per-batch cursors until complete or a total resource/access limit. After process restart, active/queued jobs become `paused_restart`; explicitly resume them. Cancellation is durable and does not delete evidence; cancelled jobs do not resume.
@@ -165,7 +173,7 @@ Source advanced limits also bound HTML documents, pending references, robots dat
 
 Only accepted candidates export. Each final PNG is written unchanged under relative `exports/<job>/`, with `provenance-local.json` (private unsigned seed/issue/page locations, reference and original/crop hashes, model revision, effective inference settings and crop recipe) and `provenance-discord.json` (no source URLs). Reference indices are explicitly tied to the frozen **identity-only** ID list; framing references are separate.
 
-`/farmer export` sends one batch per fresh interaction. Batches respect the lower of reported Discord limito not pad and tril progress. No thirs and a conservative **8 MiB total**, with at most eight files per batch. Every accepted PNG remains local, even if no Discord batch fits it. A single oversized PNG stays local with an explicit notice: it is never downscaled or placed on a public host. Contact-sheet previews alone are resized. Request batch 1, 2, etc. as needed; there is no eight-crop overall export cap. Large provenance may also remain local if it exceeds the interaction budget.
+`/farmer export` sends one batch per fresh interaction. Batches respect the lower of reported Discord limits and a conservative **8 MiB total**, with at most eight files per batch. Every accepted PNG remains local, even if no Discord batch fits it. A single oversized PNG stays local with an explicit notice: it is never downscaled or placed on a public host. Contact-sheet previews alone are resized. Request batch 1, 2, etc. as needed; there is no eight-crop overall export cap. Large provenance may also remain local if it exceeds the interaction budget.
 
 Reframing creates a separate edited crop and resets its decision to pending. Original encoded bytes/hash and earlier crop files are preserved. Local data may contain sensitive source/character information; protect your device and backup policy accordingly.
 
@@ -183,12 +191,3 @@ python tools/verify_manifest.py
 The demo uses the **real safe source adapter, SQLite worker and pixel/export code**, but an obviously injected fixed-answer matcher over self-authored shapes. It proves plumbing, not recognition. SDK and actual OWLv2 API tests have explicit missing-dependency skips offline. GitHub lightweight CI **requires real discord.py import/command serialization**, and uses read-only repository permissions. A real pretrained download/inference smoke is manual opt-in only; it never runs automatically on each text-file commit.
 
 `SOURCE-MANIFEST.sha256` lists the exact reviewed publishable text files. CI verifies every hash and fails on missing/extra/changed source. Only after review should a maintainer run `python tools/verify_manifest.py --write`. Upload the manifest and source, then the CI workflow last when publishing through the browser. A local staging tree or passing local test is not a remote GitHub commit, a successful CI run, a live bot test, or an accuracy benchmark.
-d-party comic site—including the previously mentioned example—is verified compatible or licensed. No third-party artwork was downloaded for tests.
-
-## Rights and privacy first
-
-Use only pages/references you own, have licensed, or have explicit permission to download and edit. **Public access is not a license.** Personal use and ephemeral Discord messages do not establish rights. This software does not bypass login, paywalls, DRM, CAPTCHA, robots restrictions or other access controls. It does not forward cookies, authorization, referrers or proxy settings; it does not screenshot a reader or guess missing numbered pages.
-
-Source requests are limited to explicitly configured origins/path roots. DNS addresses are validated and pinned into the actual connector; redirects are rechecked and private/reserved/local addresses are refused. Reader image selection is scoped to configured selectors, not every image in arbitrary HTML.
-
-Originals, frozen references, SQ
