@@ -141,4 +141,60 @@ class FarmerGroup(app_commands.Group):
         await self.service.run(interaction, "export", job_id=job, batch=batch, mode=mode)
 
     @app_commands.command(description="Choose/revoke an existing private server text channel for persistent results")
-    async def storage(self, interaction: discord.Interaction, channel: discord.TextChannel | 
+    async def storage(self, interaction: discord.Interaction, channel: discord.TextChannel | None = None, accept: bool | None = None):
+        await self.service.run(interaction, "storage", channel=channel, accept=accept)
+
+    @app_commands.command(description="Explicitly save accepted matches or complete collections to the private destination")
+    async def save(self, interaction: discord.Interaction, job: str, mode: Literal["accepted", "collection"] = "accepted"):
+        await self.service.run(interaction, "save", job_id=job, mode=mode)
+
+    @app_commands.command(description="Inspect persistent send receipts; unknown sends are not blindly retried")
+    async def receipts(self, interaction: discord.Interaction, job: str, offset: app_commands.Range[int, 0, 1000000] = 0):
+        await self.service.run(interaction, "receipts", job_id=job, offset=offset)
+
+    @app_commands.command(description="Show installed local version and stop/update/restart instructions")
+    async def version(self, interaction: discord.Interaction):
+        await self.service.run(interaction, "version")
+
+    @app_commands.command(description="Check canonical GitHub main only; NEVER executes code or installs from Discord")
+    async def update(self, interaction: discord.Interaction):
+        await self.service.run(interaction, "update")
+
+    @app_commands.command(description="View/change whitelisted numeric limits; never identity, token or paths")
+    async def settings(self, interaction: discord.Interaction, name: Literal["pages_per_run", "candidates_per_run", "detections_per_page", "storage_mib", "page_crop_mib", "discovery_pages", "discovery_issues", "tile_size", "max_tiles"] | None = None, value: int | None = None):
+        await self.service.run(interaction, "settings", name=name, value=value)
+
+    @app_commands.command(description="Reload safe numeric limits from local settings while jobs are paused")
+    async def reload(self, interaction: discord.Interaction):
+        await self.service.run(interaction, "reload")
+
+
+class FarmerClient(discord.Client):
+    def __init__(self, store, runner, settings):
+        super().__init__(intents=discord.Intents.none(), allowed_mentions=discord.AllowedMentions.none(), max_messages=None, application_id=settings.application_id)
+        self.test_guild = discord.Object(id=settings.guild_id)
+        self.runner = runner
+        self.tree = app_commands.CommandTree(self)
+        storage = StorageManager(store, DiscordStorageGateway(self, store.owner_id, store.guild_id),
+                                 storage_limit=getattr(settings, "storage_mib", 2048) * 1024 * 1024)
+        self.service = FarmerService(store, runner, settings, storage=storage)
+        self.service.view_factory = lambda kind, **kwargs: {"job": JobView, "review": ReviewView, "approval": ApprovalView}[kind](self.service, **kwargs)
+        self.tree.add_command(FarmerGroup(self.service), guild=self.test_guild)
+        self.tree.on_error = self.on_tree_error
+
+    async def on_tree_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        await self.service.error(interaction)
+
+    async def setup_hook(self):
+        if self.user is None or self.user.id != self.application_id:
+            raise UserError("The authenticated bot does not match the configured Application ID.")
+        await self.tree.sync(guild=self.test_guild)
+        await self.runner.start()
+
+    async def close(self):
+        await self.runner.close()
+        await super().close()
+
+    async def on_ready(self):
+        print("TechFarmer connected. Guild slash commands synced; controls are ephemeral. Only explicitly confirmed private-channel saves are persistent. Poll /farmer status.", flush=True)
+
