@@ -25,7 +25,23 @@ def cli_model_config(args):
 
 
 def build_runner(settings, store):
-    from .engine import JobRunner, RunLimitstes(), suffix=path.suffix.lower(), storage_limit=storage_limit)
+    from .engine import JobRunner, RunLimits
+    from .source_setup import prepare_source
+    from .sources import SourceClient
+    from .vision import ReferenceMatcher
+    limits = RunLimits(settings.pages_per_run, settings.candidates_per_run, settings.detections_per_page,
+                       settings.storage_mib * 1024 * 1024, settings.tile_size, settings.max_tiles, settings.page_crop_mib * 1024 * 1024)
+    runner = JobRunner(store, ReferenceMatcher(settings.model_config), lambda: SourceClient(load_source_config(settings)), limits,
+                       source_preparer=prepare_source, prepared_source_factory=SourceClient)
+    runner.source_settings = settings
+    return runner
+
+
+def local_reference(store, profile: str, path: Path, storage_limit: int):
+    if (path.is_symlink() or any(parent.is_symlink() for parent in path.parents) or not path.is_file()
+            or not 0 < path.stat().st_size <= LIMITS.reference_bytes):
+        raise UserError("A local reference must be a regular PNG/JPEG/WebP file of at most 8 MiB, not a link. It is never converted into a Discord URL.")
+    return store.add_reference(profile, path.read_bytes(), suffix=path.suffix.lower(), storage_limit=storage_limit)
 
 
 def show_job(store, job_id):
@@ -57,7 +73,21 @@ async def local_job_command(args, settings, store):
         return 0
     if args.command == "status":
         if args.job:
-            show_job(store, args.job)   if args.reference:
+            show_job(store, args.job)
+        else:
+            for job in store.jobs(limit=20):
+                show_job(store, job["id"])
+        return 0
+    runner = build_runner(settings, store)
+    if args.command == "pull":
+        if not args.url:
+            raise UserError("Use pull --url <permitted source link>; --reference is an optional local image path.")
+        if args.confirm_rights:
+            print(CONSENT_TEXT)
+            store.consent(True)
+        store.require_consent()
+        profile = args.profile
+        if args.reference:
             if args.mode not in {"auto", "match"}:
                 raise UserError("Local reference paths are only used by auto/match, not no-identity collection.")
             readiness = await asyncio.to_thread(runner.matcher.readiness)
@@ -74,7 +104,21 @@ async def local_job_command(args, settings, store):
         await runner.run_job(job["id"])
         show_job(store, job["id"])
         return 0 if store.job(job["id"])["phase"] == "review_ready" else 2
-    if not args.job:rove_source(args.job, False)
+    if not args.job:
+        raise UserError("This command requires --job with a local job ID.")
+    if args.command == "approve":
+        job = store.job(args.job)
+        if job["phase"] != "awaiting_approval":
+            raise UserError("This job has no pending external-image-origin approval.")
+        print("Approve only if you have rights for all these exact image origins:")
+        for origin in job["source_proposal"].get("required_origins", []):
+            print(" ", origin)
+        if args.accept:
+            store.approve_source(args.job, True, proposal_id=args.proposal)
+            store.control(args.job, "resume")
+            await runner.run_job(args.job)
+        elif args.revoke:
+            store.approve_source(args.job, False)
         else:
             print("Nothing approved. Repeat with --accept after inspecting the set, or --revoke to decline.")
         show_job(store, args.job)
@@ -90,7 +134,21 @@ async def local_job_command(args, settings, store):
         print(f"{plan.count} native PNGs saved locally in exports/{args.job}; {len(plan.oversized)} exceed the conservative Discord limit. No upload, resize or public fallback occurred.")
     return 0
 
-dd_argument("--aspect")
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=f"TechFarmer {__version__}: source link first; optional local reference matching")
+    parser.add_argument("command", nargs="?", default="run", choices=("run", "setup", "doctor", "download-model", "validate-config", "version", "update", "settings", "consent", "pull", "status", "approve", "control", "export"))
+    parser.add_argument("--model-cache", default=None)
+    parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default=None)
+    for key in ("owner", "guild", "application", "storage-channel"):
+        parser.add_argument("--" + key + "-id")
+    parser.add_argument("--url")
+    parser.add_argument("--reference", action="append", default=[], help="Local image path; repeat for views of ONE character. Never a CDN URL.")
+    parser.add_argument("--profile")
+    parser.add_argument("--mode", choices=("auto", "match", "collect-pages", "collect-panels"), default="auto")
+    parser.add_argument("--scope", choices=("auto", "page", "chapter", "series"), default="auto")
+    parser.add_argument("--preset", default="detected")
+    parser.add_argument("--aspect")
     parser.add_argument("--context", default="0,0,0,0")
     parser.add_argument("--trim", default="0,0,0,0")
     parser.add_argument("--align", default="center")
@@ -106,7 +164,21 @@ dd_argument("--aspect")
     parser.add_argument("--operation", choices=("pause", "resume", "cancel"))
     parser.add_argument("--selection", choices=("accepted", "collection"), default="accepted")
     parser.add_argument("--name", choices=tuple(LIMIT_FIELDS))
-    parser.add_argument("--value", type=int)          raise UserError("Run this command from the TechFarmer project folder so settings and data stay beside this installation.")
+    parser.add_argument("--value", type=int)
+    args = parser.parse_args(argv)
+    try:
+        if not ((3, 11) <= sys.version_info[:2] <= (3, 12)):
+            raise UserError("Use supported Python 3.11 or 3.12. Newer Python/vision combinations are not verified here.")
+        if args.command == "version":
+            print(f"TechFarmer {__version__}\n{REPOSITORY}\nStop bot → UPDATE-WINDOWS.cmd (or python tools/update.py --update) → restart.")
+            return 0
+        from tools.update import RuntimeLock, check_update
+        if args.command == "update":
+            result = check_update(ROOT)
+            print(f"Installed {__version__} | {result['status']}\n{result['message']}\nCheck only. Stop the bot, run UPDATE-WINDOWS.cmd or python tools/update.py --update, then restart.")
+            return 0 if result["status"] != "unavailable" else 2
+        if Path.cwd().resolve() != ROOT:
+            raise UserError("Run this command from the TechFarmer project folder so settings and data stay beside this installation.")
         with RuntimeLock(ROOT):
             if args.command == "setup":
                 values = {}
@@ -117,7 +189,21 @@ dd_argument("--aspect")
                             raise UserError("Setup needs --owner-id, --guild-id and --application-id, or an interactive local terminal. Never supply a token to setup.")
                         value = input(key.replace("_", " ") + " (nonsecret numeric ID): ")
                     values[key] = snowflake(value, key)
-                values["storage_channel_id"] = sn    matcher = ReferenceMatcher(cli_model_config(args))
+                values["storage_channel_id"] = snowflake(args.storage_channel_id, "storage_channel_id") if args.storage_channel_id else None
+                if Path(SETTINGS_NAME).exists():
+                    previous = load_settings()
+                    if any(values[key] != getattr(previous, key) for key in ("owner_id", "guild_id", "application_id")):
+                        raise UserError("Setup does not silently replace an existing installation's identity. Keep this installation and use a separate project for another owner/server.")
+                    from dataclasses import replace
+                    settings = replace(previous, storage_channel_id=values["storage_channel_id"] or previous.storage_channel_id)
+                else:
+                    settings = Settings(**values)
+                save_settings(settings)
+                print("Nonsecret settings saved. Source profile and model install are optional. Start the bot, accept rights consent, then /farmer pull. Storage ID is only a suggestion until private-channel validation and explicit /farmer storage consent.")
+                return 0
+            if args.command in {"doctor", "download-model"}:
+                from .vision import ReferenceMatcher
+                matcher = ReferenceMatcher(cli_model_config(args))
                 if args.command == "download-model":
                     print("Explicit pinned OWLv2 model preparation from Hugging Face; no user images are sent. Several GB may be needed. This is optional for no-reference collection.")
                     result = matcher.prepare_cache()
@@ -134,7 +220,21 @@ dd_argument("--aspect")
                 print("Nonsecret settings valid. Supported static sources can auto-discover; manual source profiles and vision install are NOT startup prerequisites. Rights, site compatibility and channel privacy are not verified offline.")
                 return 0
             if args.command == "settings":
-                if args.name is None and args.vallocal_job_command(args, settings, store))
+                if args.name is None and args.value is None:
+                    for key, value in settings.limits.items():
+                        print(f"{key}: {value}")
+                elif args.name is None or args.value is None:
+                    raise UserError("Use --name <numeric limit> --value <integer>.")
+                else:
+                    set_limit(settings, args.name, args.value)
+                    print("Whitelisted limit saved with backup. Frozen job inference settings remain reproducible.")
+                return 0
+            from .store import Store
+            store = Store(settings.owner_id, settings.guild_id)
+            for notice in store.notices:
+                print("NOTICE:", notice)
+            if args.command != "run":
+                return asyncio.run(local_job_command(args, settings, store))
             runner = build_runner(settings, store)
             from .bot import FarmerClient
             token = os.environ.pop("DISCORD_BOT_TOKEN", "")
@@ -149,13 +249,7 @@ dd_argument("--aspect")
                 logging.getLogger(name).propagate = False
             client = FarmerClient(store, runner, settings)
             client.run(token, log_handler=None)
-            return 0 and job status. Raw exception bodies, credentials and URLs are not logged.", file=sys.stderr)
-        return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-
+            return 0
     except UserError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -169,104 +263,9 @@ if __name__ == "__main__":
         if type(exc).__name__ in {"RuntimeBusyError", "UpdateError"}:
             print("Installation is locked or has an unfinished update. Stop the other bot/CLI/updater, then use the local updater recovery instructions. No concurrent update/run is allowed.", file=sys.stderr)
         else:
-            print("Operation failed safely. Check README, local configurationue is None:
-                    for key, value in settings.limits.items():
-                        print(f"{key}: {value}")
-                elif args.name is None or args.value is None:
-                    raise UserError("Use --name <numeric limit> --value <integer>.")
-                else:
-                    set_limit(settings, args.name, args.value)
-                    print("Whitelisted limit saved with backup. Frozen job inference settings remain reproducible.")
-                return 0
-            from .store import Store
-            store = Store(settings.owner_id, settings.guild_id)
-            for notice in store.notices:
-                print("NOTICE:", notice)
-            if args.command != "run":
-                return asyncio.run(owflake(args.storage_channel_id, "storage_channel_id") if args.storage_channel_id else None
-                if Path(SETTINGS_NAME).exists():
-                    previous = load_settings()
-                    if any(values[key] != getattr(previous, key) for key in ("owner_id", "guild_id", "application_id")):
-                        raise UserError("Setup does not silently replace an existing installation's identity. Keep this installation and use a separate project for another owner/server.")
-                    from dataclasses import replace
-                    settings = replace(previous, storage_channel_id=values["storage_channel_id"] or previous.storage_channel_id)
-                else:
-                    settings = Settings(**values)
-                save_settings(settings)
-                print("Nonsecret settings saved. Source profile and model install are optional. Start the bot, accept rights consent, then /farmer pull. Storage ID is only a suggestion until private-channel validation and explicit /farmer storage consent.")
-                return 0
-            if args.command in {"doctor", "download-model"}:
-                from .vision import ReferenceMatcher
-            
-    args = parser.parse_args(argv)
-    try:
-        if not ((3, 11) <= sys.version_info[:2] <= (3, 12)):
-            raise UserError("Use supported Python 3.11 or 3.12. Newer Python/vision combinations are not verified here.")
-        if args.command == "version":
-            print(f"TechFarmer {__version__}\n{REPOSITORY}\nStop bot → UPDATE-WINDOWS.cmd (or python tools/update.py --update) → restart.")
-            return 0
-        from tools.update import RuntimeLock, check_update
-        if args.command == "update":
-            result = check_update(ROOT)
-            print(f"Installed {__version__} | {result['status']}\n{result['message']}\nCheck only. Stop the bot, run UPDATE-WINDOWS.cmd or python tools/update.py --update, then restart.")
-            return 0 if result["status"] != "unavailable" else 2
-        if Path.cwd().resolve() != ROOT:
-  
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=f"TechFarmer {__version__}: source link first; optional local reference matching")
-    parser.add_argument("command", nargs="?", default="run", choices=("run", "setup", "doctor", "download-model", "validate-config", "version", "update", "settings", "consent", "pull", "status", "approve", "control", "export"))
-    parser.add_argument("--model-cache", default=None)
-    parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default=None)
-    for key in ("owner", "guild", "application", "storage-channel"):
-        parser.add_argument("--" + key + "-id")
-    parser.add_argument("--url")
-    parser.add_argument("--reference", action="append", default=[], help="Local image path; repeat for views of ONE character. Never a CDN URL.")
-    parser.add_argument("--profile")
-    parser.add_argument("--mode", choices=("auto", "match", "collect-pages", "collect-panels"), default="auto")
-    parser.add_argument("--scope", choices=("auto", "page", "chapter", "series"), default="auto")
-    parser.add_argument("--preset", default="detected")
-    parser.a
-        raise UserError("This command requires --job with a local job ID.")
-    if args.command == "approve":
-        job = store.job(args.job)
-        if job["phase"] != "awaiting_approval":
-            raise UserError("This job has no pending external-image-origin approval.")
-        print("Approve only if you have rights for all these exact image origins:")
-        for origin in job["source_proposal"].get("required_origins", []):
-            print(" ", origin)
-        if args.accept:
-            store.approve_source(args.job, True, proposal_id=args.proposal)
-            store.control(args.job, "resume")
-            await runner.run_job(args.job)
-        elif args.revoke:
-            store.app
-        else:
-            for job in store.jobs(limit=20):
-                show_job(store, job["id"])
-        return 0
-    runner = build_runner(settings, store)
-    if args.command == "pull":
-        if not args.url:
-            raise UserError("Use pull --url <permitted source link>; --reference is an optional local image path.")
-        if args.confirm_rights:
-            print(CONSENT_TEXT)
-            store.consent(True)
-        store.require_consent()
-        profile = args.profile
-     
-    from .source_setup import prepare_source
-    from .sources import SourceClient
-    from .vision import ReferenceMatcher
-    limits = RunLimits(settings.pages_per_run, settings.candidates_per_run, settings.detections_per_page,
-                       settings.storage_mib * 1024 * 1024, settings.tile_size, settings.max_tiles, settings.page_crop_mib * 1024 * 1024)
-    runner = JobRunner(store, ReferenceMatcher(settings.model_config), lambda: SourceClient(load_source_config(settings)), limits,
-                       source_preparer=prepare_source, prepared_source_factory=SourceClient)
-    runner.source_settings = settings
-    return runner
+            print("Operation failed safely. Check README, local configuration and job status. Raw exception bodies, credentials and URLs are not logged.", file=sys.stderr)
+        return 2
 
 
-def local_reference(store, profile: str, path: Path, storage_limit: int):
-    if (path.is_symlink() or any(parent.is_symlink() for parent in path.parents) or not path.is_file()
-            or not 0 < path.stat().st_size <= LIMITS.reference_bytes):
-        raise UserError("A local reference must be a regular PNG/JPEG/WebP file of at most 8 MiB, not a link. It is never converted into a Discord URL.")
-    return store.add_reference(profile, path.read_by
+if __name__ == "__main__":
+    raise SystemExit(main())
