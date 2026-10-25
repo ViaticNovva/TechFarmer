@@ -3,17 +3,346 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass, replace
 import getpass
+import importlib
+from importlib import metadata
+import json
 import logging
 import os
 from pathlib import Path
+import re
+import subprocess
 import sys
+import warnings
 
-from . import __version__, REPOSITORY
+# Absolute-file launch also works with -I and from another working directory.
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    __package__ = "tech_farmer"
+
+from . import __version__, REPOSITORY, PYTHON_NOTICE, VISION_PYTHON_NOTICE, runtime_label, supported_python
 from .config import LIMIT_FIELDS, SETTINGS_NAME, Settings, load_settings, load_source_config, save_settings, set_limit, snowflake
 from .safety import LIMITS, UserError, local_root
 
 ROOT = Path(__file__).resolve().parents[1]
+PYTHON_PROBE = (
+    "import json,sys,sysconfig; print(json.dumps({'version':list(sys.version_info[:3]),"
+    "'releaselevel':sys.version_info.releaselevel,'serial':sys.version_info.serial,"
+    "'implementation':sys.implementation.name,'free_threaded':bool(sysconfig.get_config_var('Py_GIL_DISABLED')),"
+    "'executable':sys.executable,'prefix':sys.prefix,'base_prefix':sys.base_prefix}))"
+)
+BASE_IMPORTS = (("discord.py", "discord"), ("aiohttp", "aiohttp"), ("Pillow", "PIL.Image"), ("beautifulsoup4", "bs4"))
+VISION_IMPORTS = (("transformers", "transformers"), ("torch", "torch"), ("safetensors", "safetensors"))
+
+
+@dataclass(frozen=True)
+class PythonRuntime:
+    command: tuple[str, ...]
+    version: tuple[int, ...]
+    executable: str
+    prefix: str
+    base_prefix: str
+
+    @property
+    def label(self):
+        return f"CPython {'.'.join(map(str, self.version))} | {self.executable}"
+
+
+def child_environment(*, token=False):
+    environment = dict(os.environ)
+    if not token:
+        environment.pop("DISCORD_BOT_TOKEN", None)
+    return environment
+
+
+def probe_python(command) -> PythonRuntime | None:
+    try:
+        result = subprocess.run([*command, "-I", "-c", PYTHON_PROBE], cwd=ROOT, shell=False,
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                timeout=15, check=False, env=child_environment())
+        if result.returncode != 0 or len(result.stdout) > 8192:
+            return None
+        data = json.loads(result.stdout)
+        version = data["version"]
+        if (not isinstance(version, list) or len(version) != 3 or any(type(v) is not int for v in version)
+                or type(data["serial"]) is not int or data["serial"] < 0
+                or not isinstance(data["implementation"], str) or not isinstance(data["releaselevel"], str)
+                or type(data["free_threaded"]) is not bool
+                or not supported_python(version, data["implementation"], data["free_threaded"], data["releaselevel"])
+                or any(not isinstance(data[key], str) or not data[key] for key in ("executable", "prefix", "base_prefix"))):
+            return None
+        return PythonRuntime(tuple(command), tuple(version), data["executable"], data["prefix"], data["base_prefix"])
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        return None
+
+
+def venv_python() -> Path:
+    return ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def choose_python(*, require_venv=False, windows=None) -> PythonRuntime:
+    from tools.update import _check_chain
+    environment = ROOT / ".venv"
+    _check_chain(environment)
+    if environment.exists():
+        runtime = probe_python((str(venv_python()),))
+        if runtime is None or Path(runtime.prefix).absolute() != environment or runtime.prefix == runtime.base_prefix:
+            raise UserError("The existing .venv is incomplete or uses an unsupported interpreter. It was NOT deleted or rebuilt. Preserve the whole installation; see README 'Choose Python 3.15' for an explicit upgrade/recovery action.")
+        return runtime
+    if require_venv:
+        raise UserError("Base setup is not installed here. Open START-WINDOWS.cmd and choose 1 first; settings and data stay in this folder.")
+    windows = os.name == "nt" if windows is None else windows
+    candidates = [("py", f"-3.{minor}") if windows else (f"python3.{minor}",) for minor in range(15, 10, -1)]
+    candidates.append((sys.executable,))
+    for command in candidates:
+        runtime = probe_python(command)
+        if runtime is not None:
+            return runtime
+    raise UserError(PYTHON_NOTICE + " Install an approved Python locally; no administrator or policy workaround is requested.")
+
+
+def verify_source():
+    from tools.update import MANIFEST, MAX_MANIFEST, _read, _verify_inventory, parse_manifest
+    _verify_inventory(ROOT, parse_manifest(_read(ROOT, MANIFEST, MAX_MANIFEST)))
+    print("Complete local source matches SOURCE-MANIFEST.sha256 (integrity, not a publisher signature).")
+
+
+def _requirements(vision=False):
+    names = {name.lower() for name, _ in BASE_IMPORTS + (VISION_IMPORTS if vision else ())}
+    declared = {}
+    for filename in ("requirements.txt", "requirements-vision.txt") if vision else ("requirements.txt",):
+        for line in (ROOT / filename).read_text(encoding="utf-8").splitlines():
+            if not line or line.startswith("#") or (filename == "requirements-vision.txt" and line == "-r requirements.txt"):
+                continue
+            match = re.fullmatch(r"([A-Za-z0-9_.-]+)((?:(?:==|>=|<=|>|<)[0-9]+(?:\.[0-9]+){1,3})(?:,(?:==|>=|<=|>|<)[0-9]+(?:\.[0-9]+){0,3})*)", line)
+            if not match or match[1].lower() not in names or match[1].lower() in declared:
+                raise UserError("Dependency declarations are not the reviewed package/version-only set. Restore complete canonical source; no packages were installed.")
+            declared[match[1].lower()] = match[2]
+    if set(declared) != names:
+        raise UserError("Dependency declarations are incomplete. Restore the complete canonical source.")
+    return declared
+
+
+def _satisfies_version(actual, spec):
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+){1,3})(?:\+[A-Za-z0-9.]+)?", actual)
+    if not match:
+        return False
+    def numeric(value):
+        parts = tuple(map(int, value.split(".")))
+        return parts + (0,) * (4 - len(parts))
+    installed = numeric(match[1])
+    for constraint in spec.split(","):
+        operator, value = re.fullmatch(r"(==|>=|<=|>|<)([0-9.]+)", constraint).groups()
+        expected = numeric(value)
+        if not {"==": installed == expected, ">=": installed >= expected, "<=": installed <= expected,
+                ">": installed > expected, "<": installed < expected}[operator]:
+            return False
+    return True
+
+
+def dependency_preflight(*, vision=False) -> int:
+    print("Actual interpreter:", runtime_label())
+    declared = _requirements(vision)
+    failed = False
+    for distribution, module in BASE_IMPORTS + (VISION_IMPORTS if vision else ()):
+        try:
+            importlib.import_module(module)
+            actual = metadata.version(distribution)
+            valid = _satisfies_version(actual, declared[distribution.lower()])
+            print(f"{distribution}: {actual} | {'version/import OK' if valid else 'outside reviewed requirements'}")
+            failed |= not valid
+        except Exception as exc:
+            print(f"{distribution}: missing/unusable ({type(exc).__name__}); use Setup/repair base or the optional vision installer.")
+            failed = True
+    if vision and sys.version_info[:2] == (3, 15):
+        print(VISION_PYTHON_NOTICE)
+    if not failed:
+        try:
+            from .bot import FarmerClient, FarmerGroup
+            if vision:
+                from .vision import _import_runtime
+                _import_runtime()
+            if not callable(FarmerClient) or not callable(FarmerGroup):
+                raise ImportError("SDK API unavailable")
+        except Exception as exc:
+            print(f"Application API import failed ({type(exc).__name__}); no connection or model download was made.")
+            failed = True
+    print("Preflight FAILED; see README diagnostics." if failed else "Actual imports/API preflight passed. No Discord login, source request, model download or recognition test was performed.")
+    return 2 if failed else 0
+
+
+def run_local(runtime, command):
+    result = subprocess.run([*runtime.command, "-I", "-X", "utf8", str(ROOT / "tech_farmer" / "__main__.py"), command],
+                            cwd=ROOT, shell=False, check=False, env=child_environment(token=command == "run"))
+    return result.returncode
+
+
+def install_dependencies(*, vision=False):
+    from tools.update import RuntimeLock, _wheel_preflight
+    with RuntimeLock(ROOT):
+        verify_source()
+        _requirements(vision)
+        runtime = choose_python(require_venv=vision)
+        print("Using", runtime.label)
+        if vision and runtime.version[:2] == (3, 15):
+            print(VISION_PYTHON_NOTICE)
+        if not (ROOT / ".venv").exists():
+            print("Creating this installation's .venv only. No global packages or user data are changed.")
+            result = subprocess.run([*runtime.command, "-m", "venv", str(ROOT / ".venv")], cwd=ROOT,
+                                    shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=180, check=False, env=child_environment())
+            if result.returncode:
+                raise UserError("Virtual-environment creation failed. Any partial .venv was preserved, not deleted. Read README recovery before retrying.")
+            runtime = choose_python(require_venv=True)
+        else:
+            print("Keeping the existing .venv and its actual Python version. Interpreter upgrades are never automatic.")
+        requirements = ROOT / ("requirements-vision.txt" if vision else "requirements.txt")
+        command = [*runtime.command, "-m", "pip", "--disable-pip-version-check", "--no-input",
+                   "--require-virtualenv", "install", "--only-binary=:all:"]
+        def pip(arguments):
+            return subprocess.run(arguments, cwd=ROOT, shell=False, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900,
+                                  check=False, env=child_environment()).returncode
+        print("Checking compatible stable wheels using your existing approved pip/index configuration. No source builds.")
+        if not _wheel_preflight([*command, "-r", str(requirements)], ROOT, environment=child_environment()):
+            raise UserError("Wheel resolution failed before installation. This can mean missing stable wheels, unavailable index/network, a prerelease/yanked/non-wheel plan or a dependency conflict; it is NOT proof your Python is unsupported. No packages were installed by this check. No index/proxy/DNS/policy change or older-Python fallback was attempted.")
+        print("Installing explicit optional vision packages (can be large). No model weights." if vision else "Installing base packages into .venv only.")
+        repair = [] if vision else ["--force-reinstall"]
+        if pip([*command, *repair, "-r", str(requirements)]):
+            raise UserError("Package installation failed; the existing .venv was kept, not rolled back. Retry this explicit setup after resolving approved index/wheel access; no data, models or source were deleted.")
+        if pip([*runtime.command, "-m", "pip", "--disable-pip-version-check", "check"]):
+            raise UserError("Installed packages have a dependency conflict. Setup is NOT complete. Keep .venv/data and inspect locally with .venv Python -m pip check; do not post secrets or raw index logs.")
+        # The child preflight is read-only and intentionally needs no RuntimeLock.
+        result = run_local(runtime, "vision-preflight" if vision else "preflight")
+        if result:
+            raise UserError("Imports/API preflight failed after installation. Setup is NOT complete; .venv and all user data were preserved. No model was downloaded and no substitute matching will run.")
+        print("Optional packages ready; prepare the model explicitly with menu 6." if vision else "Base setup complete. Next choose 2 to configure IDs, then 3 to start. Vision/model installation is optional.")
+        return 0
+
+
+def configure_ids(args):
+    previous = load_settings(environ={}) if Path(SETTINGS_NAME).exists() else None
+    interactive = sys.stdin.isatty()
+    print("Local nonsecret setup. Never enter a bot token here; Start bot has a hidden prompt.")
+    values = {}
+    for key in ("owner_id", "guild_id", "application_id"):
+        value = getattr(args, key)
+        stored = str(getattr(previous, key)) if previous else None
+        if value is None:
+            if interactive:
+                prompt = key.replace("_", " ") + (f" [Enter keeps {stored}]" if stored else " (real numeric Discord ID)") + ": "
+                value = input(prompt)
+                if not value and stored:
+                    value = stored
+            elif stored:
+                value = stored
+            else:
+                raise UserError("Setup needs --owner-id, --guild-id and --application-id, or an interactive local terminal. Never supply a token to setup.")
+        values[key] = snowflake(value, key)
+    channel = args.storage_channel_id
+    if channel is None and interactive:
+        channel = input("Private storage channel ID (optional; Enter keeps current/chooses later): ")
+    values["storage_channel_id"] = snowflake(channel, "storage_channel_id") if channel else (previous.storage_channel_id if previous else None)
+    if previous:
+        if any(values[key] != getattr(previous, key) for key in ("owner_id", "guild_id", "application_id")):
+            raise UserError("Setup does not replace this installation's owner/server/application. Existing settings/jobs were kept. Use a separate installation for another identity.")
+        settings = replace(previous, storage_channel_id=values["storage_channel_id"])
+    else:
+        settings = Settings(**values)
+    save_settings(settings)
+    print("Validated nonsecret settings saved locally with backups for prior settings; no JSON download/move needed.")
+    from urllib.parse import urlencode
+    authorization = "https://discord.com/oauth2/authorize?" + urlencode({
+        "client_id": str(settings.application_id), "scope": "bot applications.commands", "permissions": "35840",
+        "guild_id": str(settings.guild_id), "disable_guild_select": "true", "integration_type": "0"})
+    print("Only if not already authorized: open this official bot-install link yourself and approve it:", authorization)
+    print("Existing bot with these scopes usually needs only stop/update/restart, not another invitation. IDs, server permissions and channel privacy are NOT verified here.")
+    print("Start bot → /farmer consent → choose /farmer storage channel:#private accept:true → /farmer pull url:<permitted link>.")
+    return 0
+
+
+def open_local(which):
+    paths = {"instructions": ROOT / "START-HERE.html", "data": ROOT / "data"}
+    path = paths[which]
+    from tools.update import _check_chain
+    _check_chain(path)
+    print("Local path:", path)
+    if path.exists() and not (path.is_dir() if which == "data" else path.is_file()):
+        raise UserError("The local instructions/data path has an unexpected type; nothing was opened.")
+    if not path.exists():
+        print("Not created yet; setup/start will create needed local state. Nothing was moved or deleted.")
+    elif os.name == "nt":
+        os.startfile(str(path))
+    return 0
+
+
+def local_diagnostics():
+    print("Installation:", ROOT)
+    print("Settings:", "present (not printed)" if (ROOT / SETTINGS_NAME).exists() else "not configured; choose 2")
+    print("Data:", ROOT / "data", "| Exports:", ROOT / "exports")
+    print("Models: .cache/models by default, or your saved local model_cache. No models are needed for page collection.")
+    verify_source()
+    runtime = choose_python(require_venv=True)
+    print("Project environment:", runtime.label)
+    result = run_local(runtime, "preflight")
+    print("For job progress use /farmer status while the bot runs, or local 'status' after stopping it. Permissions/recognition are not checked offline.")
+    open_local("data")
+    return result
+
+
+def local_menu():
+    print(f"TechFarmer {__version__} | {REPOSITORY}\nInstallation: {ROOT}\nMenu interpreter: {runtime_label()}")
+    print("Use a local, non-shared, non-synced folder you control. No admin/UAC or policy changes. No files are moved automatically.")
+    while True:
+        print("\n1 Setup/repair base   2 Configure IDs   3 Start bot   4 Update/check/rollback source")
+        print("5 Install optional matching packages   6 Prepare optional model (explicit large download)")
+        print("7 Open instructions   8 Data/status + base diagnostics   0 Exit")
+        try:
+            choice = input("Choose a number: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nClosed. Settings, jobs and environments were kept.")
+            return 0
+        if choice in {"", "0"}:
+            return 0
+        try:
+            if choice in {"1", "5"}:
+                install_dependencies(vision=choice == "5")
+            elif choice in {"2", "3", "6"}:
+                runtime = choose_python(require_venv=choice != "2")
+                print("Using", runtime.label)
+                command = {"2": "setup", "3": "run", "6": "download-model"}[choice]
+                if choice == "6":
+                    if run_local(runtime, "vision-preflight"):
+                        print("Matching dependencies are unavailable; no model download was attempted. Base collection needs neither.")
+                        continue
+                    if input("Pinned model download may use several GB. Type DOWNLOAD to proceed: ").strip() != "DOWNLOAD":
+                        print("Cancelled. No model download requested.")
+                        continue
+                if run_local(runtime, command):
+                    print("Action did not complete. Read the diagnostic above; no success or connection is assumed.")
+            elif choice == "4":
+                print("Stop every bot/pull first. The independent updater verifies and journals SOURCE only.")
+                runtime = choose_python()
+                result = subprocess.run([*runtime.command, "-I", "-X", "utf8", str(ROOT / "tools" / "update.py")], cwd=ROOT,
+                                        shell=False, check=False, env=child_environment())
+                print("Close/reopen START-WINDOWS.cmd after source changes so no old menu code remains in memory. Then Setup/repair base and Start bot.")
+                return result.returncode
+            elif choice == "7":
+                open_local("instructions")
+            elif choice == "8":
+                local_diagnostics()
+            else:
+                print("Choose one of the displayed numbers. No command or URL was executed.")
+        except UserError as exc:
+            print(str(exc))
+        except (OSError, subprocess.SubprocessError, EOFError, KeyboardInterrupt):
+            print("Local action stopped/failed. Preserve settings/data/.venv; inspect README. No policy workaround or secret log is used.")
+        except Exception as exc:
+            if type(exc).__name__ in {"RuntimeBusyError", "UpdateError"}:
+                print(str(exc))
+            else:
+                print("Local action failed safely. Close other bot/updater windows and check README; raw exceptions are not printed.")
 
 
 def cli_model_config(args):
@@ -137,7 +466,7 @@ async def local_job_command(args, settings, store):
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=f"TechFarmer {__version__}: source link first; optional local reference matching")
-    parser.add_argument("command", nargs="?", default="run", choices=("run", "setup", "doctor", "download-model", "validate-config", "version", "update", "settings", "consent", "pull", "status", "approve", "control", "export"))
+    parser.add_argument("command", nargs="?", default="run", choices=("run", "setup", "menu", "install-base", "install-vision", "preflight", "vision-preflight", "diagnostics", "doctor", "download-model", "validate-config", "version", "update", "settings", "consent", "pull", "status", "approve", "control", "export"))
     parser.add_argument("--model-cache", default=None)
     parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default=None)
     for key in ("owner", "guild", "application", "storage-channel"):
@@ -166,51 +495,50 @@ def main(argv=None) -> int:
     parser.add_argument("--name", choices=tuple(LIMIT_FIELDS))
     parser.add_argument("--value", type=int)
     args = parser.parse_args(argv)
+    original_cwd = Path.cwd()
     try:
-        if not ((3, 11) <= sys.version_info[:2] <= (3, 12)):
-            raise UserError("Use supported Python 3.11 or 3.12. Newer Python/vision combinations are not verified here.")
+        if not supported_python():
+            raise UserError(PYTHON_NOTICE)
         if args.command == "version":
-            print(f"TechFarmer {__version__}\n{REPOSITORY}\nStop bot → UPDATE-WINDOWS.cmd (or python tools/update.py --update) → restart.")
+            print(f"TechFarmer {__version__}\n{REPOSITORY}\nActual interpreter: {runtime_label()}\nStop bot → START-WINDOWS.cmd menu 4 (or UPDATE-WINDOWS.cmd) → reopen menu → setup/repair base → restart.")
             return 0
+        args.reference = [str(Path(path).absolute()) for path in args.reference]
+        os.chdir(ROOT)
+        if args.command == "menu":
+            return local_menu()
+        if args.command in {"preflight", "vision-preflight"}:
+            return dependency_preflight(vision=args.command == "vision-preflight")
+        if args.command in {"install-base", "install-vision"}:
+            return install_dependencies(vision=args.command == "install-vision")
+        if args.command == "diagnostics":
+            return local_diagnostics()
         from tools.update import RuntimeLock, check_update
         if args.command == "update":
             result = check_update(ROOT)
-            print(f"Installed {__version__} | {result['status']}\n{result['message']}\nCheck only. Stop the bot, run UPDATE-WINDOWS.cmd or python tools/update.py --update, then restart.")
+            print(f"Installed {__version__} | {result['status']}\n{result['message']}\nCheck only. Stop the bot, run START-WINDOWS.cmd menu 4 or UPDATE-WINDOWS.cmd, then restart.")
             return 0 if result["status"] != "unavailable" else 2
-        if Path.cwd().resolve() != ROOT:
-            raise UserError("Run this command from the TechFarmer project folder so settings and data stay beside this installation.")
         with RuntimeLock(ROOT):
             if args.command == "setup":
-                values = {}
-                for key in ("owner_id", "guild_id", "application_id"):
-                    value = getattr(args, key)
-                    if not value:
-                        if not sys.stdin.isatty():
-                            raise UserError("Setup needs --owner-id, --guild-id and --application-id, or an interactive local terminal. Never supply a token to setup.")
-                        value = input(key.replace("_", " ") + " (nonsecret numeric ID): ")
-                    values[key] = snowflake(value, key)
-                values["storage_channel_id"] = snowflake(args.storage_channel_id, "storage_channel_id") if args.storage_channel_id else None
-                if Path(SETTINGS_NAME).exists():
-                    previous = load_settings()
-                    if any(values[key] != getattr(previous, key) for key in ("owner_id", "guild_id", "application_id")):
-                        raise UserError("Setup does not silently replace an existing installation's identity. Keep this installation and use a separate project for another owner/server.")
-                    from dataclasses import replace
-                    settings = replace(previous, storage_channel_id=values["storage_channel_id"] or previous.storage_channel_id)
-                else:
-                    settings = Settings(**values)
-                save_settings(settings)
-                print("Nonsecret settings saved. Source profile and model install are optional. Start the bot, accept rights consent, then /farmer pull. Storage ID is only a suggestion until private-channel validation and explicit /farmer storage consent.")
-                return 0
+                return configure_ids(args)
             if args.command in {"doctor", "download-model"}:
-                from .vision import ReferenceMatcher
+                from .vision import ModelUnavailable, ReferenceMatcher
                 matcher = ReferenceMatcher(cli_model_config(args))
                 if args.command == "download-model":
+                    if dependency_preflight(vision=True):
+                        raise UserError("Optional vision preflight failed. No model download was attempted; base no-reference collection needs no model.")
                     print("Explicit pinned OWLv2 model preparation from Hugging Face; no user images are sent. Several GB may be needed. This is optional for no-reference collection.")
-                    result = matcher.prepare_cache()
+                    try:
+                        result = matcher.prepare_cache()
+                    except ModelUnavailable as exc:
+                        result = {"ready": False, "code": exc.code, "message": str(exc), "action": exc.action}
                 else:
                     result = matcher.readiness()
                 print("Model status:", result.get("code", "unknown"), "\n", result.get("message", ""), "\n", result.get("action", ""))
                 return 0 if result.get("ready") else 2
+            if args.command == "run":
+                verify_source()
+                if dependency_preflight():
+                    raise UserError("Base imports are not ready; use START-WINDOWS.cmd → Setup/repair base. No token was requested and no Discord connection was made.")
             settings = load_settings()
             if args.command == "validate-config":
                 config = load_source_config(settings)
@@ -241,7 +569,12 @@ def main(argv=None) -> int:
             if not token:
                 if not sys.stdin.isatty():
                     raise UserError("Run in a local terminal for the hidden token prompt or supply DISCORD_BOT_TOKEN in the process environment, never JSON, a URL or a command argument.")
-                token = getpass.getpass("Bot token (hidden, local console only): ")
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", getpass.GetPassWarning)
+                        token = getpass.getpass("Bot token (hidden, local console only): ")
+                except (getpass.GetPassWarning, EOFError):
+                    raise UserError("A hidden console prompt is unavailable. Use a real local terminal or the process environment; never enter the token into an echoing prompt or command argument.") from None
             if not token.strip() or any(char.isspace() for char in token):
                 raise UserError("Token is empty or contains whitespace. Nothing was connected.")
             for name in ("discord", "aiohttp", "huggingface_hub", "transformers"):
@@ -265,6 +598,9 @@ def main(argv=None) -> int:
         else:
             print("Operation failed safely. Check README, local configuration and job status. Raw exception bodies, credentials and URLs are not logged.", file=sys.stderr)
         return 2
+    finally:
+        if Path.cwd() != original_cwd:
+            os.chdir(original_cwd)
 
 
 if __name__ == "__main__":
