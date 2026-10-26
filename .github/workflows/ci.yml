@@ -1,0 +1,145 @@
+name: Reviewed Python compatibility and offline tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      vision_api:
+        description: Check stable vision wheels and tiny actual OWLv2 API (large packages, NO pretrained model)
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Keep reviewed LF bytes on Windows without writing machine/global Git settings.
+env:
+  GIT_CONFIG_COUNT: '2'
+  GIT_CONFIG_KEY_0: core.autocrlf
+  GIT_CONFIG_VALUE_0: 'false'
+  GIT_CONFIG_KEY_1: core.eol
+  GIT_CONFIG_VALUE_1: lf
+
+concurrency:
+  group: techfarmer-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  base-compatibility:
+    name: Base / ${{ matrix.os }} / CPython ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.12', '3.13', '3.14', '3.15']
+    env:
+      TECH_FARMER_REQUIRE_SDK: '1'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: false
+          cache: pip
+      - name: Verify complete reviewed source BEFORE package installation
+        run: python -B tools/verify_manifest.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Resolve compatible stable base wheels (never compile or ignore Requires-Python)
+        run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all: --dry-run --ignore-installed -r requirements.txt
+      - name: Install only base wheels from the configured package index
+        run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all: -r requirements.txt
+      - name: Check dependency closure
+        run: python -m pip check
+      - name: Require ACTUAL imports and application SDK (missing means failed, not skipped)
+        run: python -B -m tech_farmer preflight
+      - name: Offline unit, SDK, native filesystem and updater fixtures (no login or live update)
+        run: python -B -m unittest discover -s tests -v
+      - name: Local setup JavaScript and launcher static checks
+        run: node tests/test_setup.cjs
+      - name: Procedural full pipeline (fixture matcher, not recognition)
+        run: python -B tools/demo.py
+      - name: Confirm tests did not alter publishable source
+        run: python -B tools/verify_manifest.py
+
+  optional-vision-api:
+    if: github.event_name == 'workflow_dispatch' && inputs.vision_api
+    name: Optional vision / ${{ matrix.os }} / CPython ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.12', '3.15']
+    env:
+      TECH_FARMER_REQUIRE_SDK: '1'
+      TECH_FARMER_REQUIRE_VISION: '1'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: false
+          cache: pip
+      - name: Verify complete reviewed source BEFORE package installation
+        run: python -B tools/verify_manifest.py
+      # As of 2026-10-25, stable Torch 2.14.1 has no cp315 wheel. A missing wheel
+      # MUST fail this opt-in job; no continue-on-error, skip-as-green or fallback.
+      - name: Resolve optional compatible stable wheels without pretrained weights
+        run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all: --dry-run --ignore-installed -r requirements-vision.txt
+      - name: Explicit optional vision packages only (can be large)
+        run: >-
+          python -m pip install --disable-pip-version-check --only-binary=:all: -r requirements-vision.txt
+      - name: Check installed dependency closure
+        run: python -m pip check
+      - name: Require actual OWLv2/Torch/safetensors API imports
+        run: python -B -m tech_farmer vision-preflight
+      - name: Tiny random-weight actual OWLv2 API (NO pretrained model download)
+        run: python -B -m unittest tests.test_vision_framing.RandomWeightOwlv2ApiSmoke -v
+      - name: Confirm no publishable source changes
+        run: python -B tools/verify_manifest.py
+
+  verified-source-artifact:
+    needs: [base-compatibility, optional-vision-api]
+    if: >-
+      always() && needs.base-compatibility.result == 'success' &&
+      (needs.optional-vision-api.result == 'success' || needs.optional-vision-api.result == 'skipped') &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.15'
+          allow-prereleases: false
+      - name: Reverify and package ONLY manifest-listed source after successful trusted-main checks
+        run: python -B tools/verify_manifest.py --archive
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TechFarmer-verified-source
+          path: .runtime/ci-source/TechFarmer-source.zip
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
