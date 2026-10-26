@@ -1,0 +1,6 @@
+# Optional only. Latest verified Torch 2.14.1 has no cp315 wheel (2026-10-25).
+# A future stable wheel still must pass resolver/import/API checks; no nightly or compiler fallback.
+-r requirements.txt
+transformers==4.57.6
+torch>=2.2,<3
+safetensors>=0.4.3,<1
