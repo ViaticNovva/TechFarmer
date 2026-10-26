@@ -4,6 +4,8 @@
 !.env.example
 tech-farmer-settings.json
 source-profiles.json
+tech-farmer-settings.json.backup-*
+source-profiles.json.backup-*
 data/
 exports/
 .cache/
