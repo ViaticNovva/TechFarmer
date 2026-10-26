@@ -327,7 +327,7 @@ class MigrationAndCliTests(unittest.TestCase):
         with workspace() as relative:
             root = relative.resolve()
             install(root, new_files())
-            (root / "unexpected.py").write_text('"""Not in the old updater allowlist."""\n')
+            (root / "unexpected.py").write_bytes(b'"""Not in the old updater allowlist."""\n')
             with patch.object(verify_manifest, "ROOT", root), redirect_stdout(StringIO()), redirect_stderr(StringIO()) as output:
                 self.assertEqual(verify_manifest.main(["--archive"]), 1)
             self.assertIn("exact updater allowlist", output.getvalue())
@@ -336,12 +336,16 @@ class MigrationAndCliTests(unittest.TestCase):
     def test_manifest_excludes_runtime_private_backups_and_requires_nonempty_text(self):
         from tools import verify_manifest
         with workspace() as root:
-            (root / "sample.py").write_text('"""source"""\n')
+            (root / "sample.py").write_bytes(b'"""source"""\n')
             (root / "tech-farmer-settings.json.backup-123").write_text('{"private":"local"}\n')
             (root / ".runtime").mkdir()
             (root / ".runtime" / "techfarmer.lock").write_bytes(b"lock")
             with patch.object(verify_manifest, "ROOT", root.resolve()):
                 self.assertEqual(set(verify_manifest.inventory()), {"sample.py"})
+                with self.subTest(line_endings="CRLF"):
+                    (root / "sample.py").write_bytes(b'"""source"""\r\n')
+                    with self.assertRaisesRegex(ValueError, "LF newlines"):
+                        verify_manifest.inventory()
                 (root / "sample.py").write_text("")
                 with self.assertRaises(ValueError):
                     verify_manifest.inventory()
